@@ -108,6 +108,7 @@
     "delete_router": "rule:admin_or_owner",
 
     "create_floatingip": "rule:regular_user",
+    "create_floatingip:floating_ip_address": "rule:admin_only",
     "update_floatingip": "rule:admin_or_owner",
     "delete_floatingip": "rule:admin_or_owner",
     "get_floatingip": "rule:admin_or_owner",
