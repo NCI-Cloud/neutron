@@ -614,16 +614,28 @@ class L3_NAT_db_mixin(l3.RouterPluginBase):
             msg = _("Network %s is not a valid external network") % f_net_id
             raise n_exc.BadRequest(resource='floatingip', msg=msg)
 
+        if fip.get('floating_ip_address'):
+            if not context.is_admin:
+                reason = _('Only admins can specify the floating IP address')
+                raise n_exc.AdminRequired(reason=reason)
+            admin_ctx = context
+            port_fixed_ips = [{'ip_address': fip['floating_ip_address']}]
+        else:
+            # An IP address will be automatically allocated from the
+            # relevant pool.
+            admin_ctx = context.elevated()
+            port_fixed_ips = attributes.ATTR_NOT_SPECIFIED
+
         with context.session.begin(subtransactions=True):
             # This external port is never exposed to the tenant.
             # it is used purely for internal system and admin use when
             # managing floating IPs.
-            external_port = self._core_plugin.create_port(context.elevated(), {
+            external_port = self._core_plugin.create_port(admin_ctx, {
                 'port':
                 {'tenant_id': '',  # tenant intentionally not set
                  'network_id': f_net_id,
                  'mac_address': attributes.ATTR_NOT_SPECIFIED,
-                 'fixed_ips': attributes.ATTR_NOT_SPECIFIED,
+                 'fixed_ips': port_fixed_ips,
                  'admin_state_up': True,
                  'device_id': fip_id,
                  'device_owner': DEVICE_OWNER_FLOATINGIP,
