@@ -40,6 +40,7 @@ from neutron.db import extraroute_db
 from neutron.db import l3_agentschedulers_db
 from neutron.db import l3_rpc_base
 from neutron.db import portbindings_db
+from neutron.db import quota_db  # noqa
 from neutron.extensions import portbindings
 from neutron.extensions import providernet
 from neutron.openstack.common import excutils
@@ -100,7 +101,7 @@ class N1kvNeutronPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
     # This attribute specifies whether the plugin supports or not
     # bulk operations.
     __native_bulk_support = False
-    supported_extension_aliases = ["provider", "agent",
+    supported_extension_aliases = ["provider", "agent", "quotas",
                                    "n1kv", "network_profile",
                                    "policy_profile", "external-net", "router",
                                    "binding", "credential",
@@ -112,8 +113,9 @@ class N1kvNeutronPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         Initialize Nexus1000V Neutron plugin.
 
         1. Initialize VIF type to OVS
-        2. Initialize Nexus1000v and Credential DB
-        3. Establish communication with Cisco Nexus1000V
+        2. clear N1kv credential
+        3. Initialize Nexus1000v and Credential DB
+        4. Establish communication with Cisco Nexus1000V
         """
         super(N1kvNeutronPluginV2, self).__init__()
         self.base_binding_dict = {
@@ -122,6 +124,7 @@ class N1kvNeutronPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
                 # TODO(rkukura): Replace with new VIF security details
                 portbindings.CAP_PORT_FILTER:
                 'security-group' in self.supported_extension_aliases}}
+        network_db_v2.delete_all_n1kv_credentials()
         c_cred.Store.initialize()
         self._setup_vsm()
         self._setup_rpc()
@@ -883,8 +886,6 @@ class N1kvNeutronPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         LOG.debug(_('_send_delete_port_request: %s'), port['id'])
         n1kvclient = n1kv_client.Client()
         n1kvclient.delete_n1kv_port(vm_network['name'], port['id'])
-        if vm_network['port_count'] == 0:
-            n1kvclient.delete_vm_network(vm_network['name'])
 
     def _get_segmentation_id(self, context, id):
         """
@@ -1053,6 +1054,10 @@ class N1kvNeutronPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
         session = context.session
         with session.begin(subtransactions=True):
             network = self.get_network(context, id)
+            if network['subnets']:
+                msg = _("Cannot delete network '%s', "
+                        "delete the associated subnet first") % network['name']
+                raise n_exc.InvalidInput(error_message=msg)
             if n1kv_db_v2.is_trunk_member(session, id):
                 msg = _("Cannot delete network '%s' "
                         "that is member of a trunk segment") % network['name']
@@ -1065,6 +1070,7 @@ class N1kvNeutronPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
             # the network_binding record is deleted via cascade from
             # the network record, so explicit removal is not necessary
         self._send_delete_network_request(context, network)
+        self._process_l3_delete(context, id)
         LOG.debug("Deleted network: %s", id)
 
     def _delete_network_db(self, context, id):
@@ -1319,6 +1325,10 @@ class N1kvNeutronPluginV2(db_base_plugin_v2.NeutronDbPluginV2,
                       self).delete_subnet(context, sub['id'])
         else:
             LOG.debug(_("Created subnet: %s"), sub['id'])
+            if not q_conf.CONF.network_auto_schedule:
+                # Schedule network to a DHCP agent
+                net = self.get_network(context, sub['network_id'])
+                self.schedule_network(context, net)
             return sub
 
     def update_subnet(self, context, id, subnet):

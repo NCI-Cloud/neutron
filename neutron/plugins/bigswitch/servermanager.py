@@ -377,7 +377,8 @@ class ServerPool(object):
         a given path.
         '''
         try:
-            cert = ssl.get_server_certificate((server, port))
+            cert = ssl.get_server_certificate((server, port),
+                                              ssl_version=ssl.PROTOCOL_TLSv1)
         except Exception as e:
             raise cfg.Error(_('Could not retrieve initial '
                               'certificate from controller %(server)s. '
@@ -438,8 +439,6 @@ class ServerPool(object):
                 if not self.get_topo_function:
                     raise cfg.Error(_('Server requires synchronization, '
                                       'but no topology function was defined.'))
-                # The hash was incorrect so it needs to be removed
-                hash_handler.put_hash('')
                 data = self.get_topo_function(**self.get_topo_function_args)
                 active_server.rest_call('PUT', TOPOLOGY_PATH, data,
                                         timeout=None)
@@ -465,6 +464,13 @@ class ServerPool(object):
                            'data': ret[3]})
                 active_server.failed = True
 
+        # A failure on a delete means the object is gone from Neutron but not
+        # from the controller. Set the consistency hash to a bad value to
+        # trigger a sync on the next check.
+        # NOTE: The hash must have a comma in it otherwise it will be ignored
+        # by the backend.
+        if action == 'DELETE':
+            hash_handler.put_hash('INCONSISTENT,INCONSISTENT')
         # All servers failed, reset server list and try again next time
         LOG.error(_('ServerProxy: %(action)s failure for all servers: '
                     '%(server)r'),
@@ -621,8 +627,9 @@ class HTTPSConnectionWithValidation(httplib.HTTPSConnection):
         if self.combined_cert:
             self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
                                         cert_reqs=ssl.CERT_REQUIRED,
-                                        ca_certs=self.combined_cert)
+                                        ca_certs=self.combined_cert,
+                                        ssl_version=ssl.PROTOCOL_TLSv1)
         else:
-            self.sock = ssl.wrap_socket(sock, self.key_file,
-                                        self.cert_file,
-                                        cert_reqs=ssl.CERT_NONE)
+            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
+                                        cert_reqs=ssl.CERT_NONE,
+                                        ssl_version=ssl.PROTOCOL_TLSv1)

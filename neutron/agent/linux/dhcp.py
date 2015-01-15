@@ -22,7 +22,6 @@ import re
 import shutil
 import socket
 import sys
-import uuid
 
 import netaddr
 from oslo.config import cfg
@@ -32,6 +31,7 @@ from neutron.agent.linux import ip_lib
 from neutron.agent.linux import utils
 from neutron.common import constants
 from neutron.common import exceptions
+from neutron.common import utils as commonutils
 from neutron.openstack.common import importutils
 from neutron.openstack.common import jsonutils
 from neutron.openstack.common import log as logging
@@ -183,15 +183,17 @@ class DhcpLocalProcess(DhcpBase):
         """Disable DHCP for this network by killing the local process."""
         pid = self.pid
 
-        if self.active:
-            cmd = ['kill', '-9', pid]
-            utils.execute(cmd, self.root_helper)
+        if pid:
+            if self.active:
+                cmd = ['kill', '-9', pid]
+                utils.execute(cmd, self.root_helper)
+            else:
+                LOG.debug(_('DHCP for %(net_id)s is stale, pid %(pid)d '
+                            'does not exist, performing cleanup'),
+                          {'net_id': self.network.id, 'pid': pid})
             if not retain_port:
-                self.device_manager.destroy(self.network, self.interface_name)
-
-        elif pid:
-            LOG.debug(_('DHCP for %(net_id)s pid %(pid)d is stale, ignoring '
-                        'command'), {'net_id': self.network.id, 'pid': pid})
+                self.device_manager.destroy(self.network,
+                                            self.interface_name)
         else:
             LOG.debug(_('No DHCP started for %s'), self.network.id)
 
@@ -543,7 +545,8 @@ class Dnsmasq(DhcpLocalProcess):
             host_routes = []
             for hr in subnet.host_routes:
                 if hr.destination == "0.0.0.0/0":
-                    gateway = hr.nexthop
+                    if not gateway:
+                        gateway = hr.nexthop
                 else:
                     host_routes.append("%s,%s" % (hr.destination, hr.nexthop))
 
@@ -558,6 +561,8 @@ class Dnsmasq(DhcpLocalProcess):
                 )
 
             if host_routes:
+                if gateway and subnet.ip_version == 4:
+                    host_routes.append("%s,%s" % ("0.0.0.0/0", gateway))
                 options.append(
                     self._format_option(i, 'classless-static-route',
                                         ','.join(host_routes)))
@@ -658,8 +663,25 @@ class Dnsmasq(DhcpLocalProcess):
 
     @classmethod
     def should_enable_metadata(cls, conf, network):
-        """True if there exists a subnet for which a metadata proxy is needed
+        """Determine whether the metadata proxy is needed for a network
+
+        This method returns True for truly isolated networks (ie: not attached
+        to a router), when the enable_isolated_metadata flag is True.
+
+        This method also returns True when enable_metadata_network is True,
+        and the network passed as a parameter has a subnet in the link-local
+        CIDR, thus characterizing it as a "metadata" network. The metadata
+        network is used by solutions which do not leverage the l3 agent for
+        providing access to the metadata service via logical routers built
+        with 3rd party backends.
         """
+        if conf.enable_metadata_network and conf.enable_isolated_metadata:
+            # check if the network has a metadata subnet
+            meta_cidr = netaddr.IPNetwork(METADATA_DEFAULT_CIDR)
+            if any(netaddr.IPNetwork(s.cidr) in meta_cidr
+                   for s in network.subnets):
+                return True
+
         if not conf.use_namespaces or not conf.enable_isolated_metadata:
             return False
 
@@ -721,9 +743,7 @@ class DeviceManager(object):
         """Return a unique DHCP device ID for this host on the network."""
         # There could be more than one dhcp server per network, so create
         # a device id that combines host and network ids
-
-        host_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, socket.gethostname())
-        return 'dhcp%s-%s' % (host_uuid, network.id)
+        return commonutils.get_dhcp_agent_device_id(network.id, self.conf.host)
 
     def _set_default_route(self, network, device_name):
         """Sets the default gateway for this dhcp namespace.
@@ -799,6 +819,19 @@ class DeviceManager(object):
                     dhcp_port = port
                 # break since we found port that matches device_id
                 break
+
+        # check for a reserved DHCP port
+        if dhcp_port is None:
+            LOG.debug(_('DHCP port %(device_id)s on network %(network_id)s'
+                        ' does not yet exist. Checking for a reserved port.'),
+                      {'device_id': device_id, 'network_id': network.id})
+            for port in network.ports:
+                port_device_id = getattr(port, 'device_id', None)
+                if port_device_id == constants.DEVICE_ID_RESERVED_DHCP_PORT:
+                    dhcp_port = self.plugin.update_dhcp_port(
+                        port.id, {'port': {'device_id': device_id}})
+                    if dhcp_port:
+                        break
 
         # DHCP port has not yet been created.
         if dhcp_port is None:

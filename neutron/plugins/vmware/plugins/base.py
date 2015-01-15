@@ -752,9 +752,14 @@ class NsxPluginV2(addr_pair_db.AllowedAddressPairsMixin,
         for segment in network[mpnet.SEGMENTS]:
             network_type = segment.get(pnet.NETWORK_TYPE)
             physical_network = segment.get(pnet.PHYSICAL_NETWORK)
+            physical_network_set = attr.is_attr_set(physical_network)
             segmentation_id = segment.get(pnet.SEGMENTATION_ID)
             network_type_set = attr.is_attr_set(network_type)
             segmentation_id_set = attr.is_attr_set(segmentation_id)
+
+            # If the physical_network_uuid isn't passed in use the default one.
+            if not physical_network_set:
+                physical_network = cfg.CONF.default_tz_uuid
 
             err_msg = None
             if not network_type_set:
@@ -777,8 +782,11 @@ class NsxPluginV2(addr_pair_db.AllowedAddressPairsMixin,
                                 'max_id': constants.MAX_VLAN_TAG})
                 else:
                     # Verify segment is not already allocated
-                    bindings = nsx_db.get_network_bindings_by_vlanid(
-                        context.session, segmentation_id)
+                    bindings = (
+                        nsx_db.get_network_bindings_by_vlanid_and_physical_net(
+                            context.session, segmentation_id,
+                            physical_network)
+                    )
                     if bindings:
                         raise n_exc.VlanIdInUse(
                             vlan_id=segmentation_id,
@@ -1038,7 +1046,10 @@ class NsxPluginV2(addr_pair_db.AllowedAddressPairsMixin,
         if not external:
             lswitch_ids = nsx_utils.get_nsx_switch_ids(
                 context.session, self.cluster, id)
-        super(NsxPluginV2, self).delete_network(context, id)
+        with context.session.begin(subtransactions=True):
+            self._process_l3_delete(context, id)
+            super(NsxPluginV2, self).delete_network(context, id)
+
         # clean up network owned ports
         for port in router_iface_ports:
             try:
@@ -1995,15 +2006,17 @@ class NsxPluginV2(addr_pair_db.AllowedAddressPairsMixin,
     def disassociate_floatingips(self, context, port_id):
         try:
             fip_qry = context.session.query(l3_db.FloatingIP)
-            fip_db = fip_qry.filter_by(fixed_port_id=port_id).one()
-            nsx_router_id = nsx_utils.get_nsx_router_id(
-                context.session, self.cluster, fip_db.router_id)
-            self._retrieve_and_delete_nat_rules(context,
-                                                fip_db.floating_ip_address,
-                                                fip_db.fixed_ip_address,
-                                                nsx_router_id,
-                                                min_num_rules_expected=1)
-            self._remove_floatingip_address(context, fip_db)
+            fip_dbs = fip_qry.filter_by(fixed_port_id=port_id)
+
+            for fip_db in fip_dbs:
+                nsx_router_id = nsx_utils.get_nsx_router_id(
+                    context.session, self.cluster, fip_db.router_id)
+                self._retrieve_and_delete_nat_rules(context,
+                                                    fip_db.floating_ip_address,
+                                                    fip_db.fixed_ip_address,
+                                                    nsx_router_id,
+                                                    min_num_rules_expected=1)
+                self._remove_floatingip_address(context, fip_db)
         except sa_exc.NoResultFound:
             LOG.debug(_("The port '%s' is not associated with floating IPs"),
                       port_id)

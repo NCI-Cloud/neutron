@@ -730,6 +730,14 @@ class L3_NAT_db_mixin(l3.RouterPluginBase):
                                     marker_obj=marker_obj,
                                     page_reverse=page_reverse)
 
+    def delete_disassociated_floatingips(self, context, network_id):
+        query = self._model_query(context, FloatingIP)
+        query = query.filter_by(floating_network_id=network_id,
+                                fixed_port_id=None,
+                                router_id=None)
+        for fip in query:
+            self.delete_floatingip(context, fip.id)
+
     def get_floatingips_count(self, context, filters=None):
         return self._get_collection_count(context, FloatingIP,
                                           filters=filters)
@@ -763,19 +771,13 @@ class L3_NAT_db_mixin(l3.RouterPluginBase):
         router_ids = []
 
         with context.session.begin(subtransactions=True):
-            try:
-                fip_qry = context.session.query(FloatingIP)
-                floating_ip = fip_qry.filter_by(fixed_port_id=port_id).one()
+            fip_qry = context.session.query(FloatingIP)
+            floating_ips = fip_qry.filter_by(fixed_port_id=port_id)
+            for floating_ip in floating_ips:
                 router_ids.append(floating_ip['router_id'])
                 floating_ip.update({'fixed_port_id': None,
                                     'fixed_ip_address': None,
                                     'router_id': None})
-            except exc.NoResultFound:
-                return
-            except exc.MultipleResultsFound:
-                # should never happen
-                raise Exception(_('Multiple floating IPs found for port %s')
-                                % port_id)
         if do_notify:
             self.notify_routers_updated(context, router_ids)
             # since caller assumes that we handled notifications on its
@@ -787,7 +789,7 @@ class L3_NAT_db_mixin(l3.RouterPluginBase):
     def notify_routers_updated(self, context, router_ids):
         if router_ids:
             self.l3_rpc_notifier.routers_updated(
-                context, router_ids)
+                context, router_ids, 'disassociate_floatingips')
 
     def _build_routers_list(self, routers, gw_ports):
         gw_port_id_gw_port_dict = dict((gw_port['id'], gw_port)
